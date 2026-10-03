@@ -1,0 +1,196 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create the Android project
+        run: |
+          HTML=index-2.html
+          if [ ! -f "$HTML" ]; then HTML=$(ls -t *.html 2>/dev/null | head -n 1); fi
+          if [ -z "$HTML" ]; then echo "No .html file found in the repo root. Upload your player html next to this workflow."; exit 1; fi
+          echo "Using $HTML"
+          mkdir -p www
+          cp "$HTML" www/index.html
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.smoothplayer.app",
+            "appName": "Smooth Player",
+            "webDir": "www",
+            "server": { "androidScheme": "https", "cleartext": true },
+            "android": { "allowMixedContent": true }
+          }
+          EOF
+          npx cap add android
+
+      - name: Add real volume + brightness + full screen + app icon
+        run: |
+          DIR=android/app/src/main/java/com/smoothplayer/app
+          mkdir -p $DIR
+          cat > $DIR/MainActivity.java <<'EOF'
+          package com.smoothplayer.app;
+
+          import android.content.Context;
+          import android.content.pm.ActivityInfo;
+          import android.media.AudioManager;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.KeyEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import androidx.activity.OnBackPressedCallback;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            private AudioManager am;
+            private OnBackPressedCallback fsBack;
+
+            public class Controls {
+              @JavascriptInterface
+              public void setBrightness(final double x) {
+                runOnUiThread(new Runnable() { public void run() {
+                  WindowManager.LayoutParams lp = getWindow().getAttributes();
+                  lp.screenBrightness = (float) Math.max(0.02, Math.min(1.0, x));
+                  getWindow().setAttributes(lp);
+                }});
+              }
+
+              @JavascriptInterface
+              public double getBrightness() {
+                float b = getWindow().getAttributes().screenBrightness;
+                if (b >= 0) return b;
+                try {
+                  return Settings.System.getInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS) / 255.0;
+                } catch (Exception e) { return 0.5; }
+              }
+
+              @JavascriptInterface
+              public void setVolume(double x) {
+                int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                int level = (int) Math.round(Math.max(0, Math.min(1, x)) * max);
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0);
+              }
+
+              @JavascriptInterface
+              public double getVolume() { return currentVolume(); }
+
+              @JavascriptInterface
+              public void setFullscreen(final boolean on, final boolean landscape) {
+                runOnUiThread(new Runnable() { public void run() {
+                  fsBack.setEnabled(on);
+                  View d = getWindow().getDecorView();
+                  if (on) {
+                    setRequestedOrientation(landscape ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                    d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                      | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+                  } else {
+                    setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                    d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+                  }
+                }});
+              }
+            }
+
+            private double currentVolume() {
+              int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+              return max > 0 ? am.getStreamVolume(AudioManager.STREAM_MUSIC) / (double) max : 0;
+            }
+
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+              setVolumeControlStream(AudioManager.STREAM_MUSIC);
+              getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              fsBack = new OnBackPressedCallback(false) {
+                @Override public void handleOnBackPressed() {
+                  getBridge().getWebView().evaluateJavascript("window.onNativeBack&&window.onNativeBack()", null);
+                }
+              };
+              getOnBackPressedDispatcher().addCallback(this, fsBack);
+              getBridge().getWebView().addJavascriptInterface(new Controls(), "NativeControls");
+            }
+
+            @Override
+            public boolean onKeyDown(int keyCode, KeyEvent event) {
+              boolean r = super.onKeyDown(keyCode, event);
+              if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                final WebView wv = getBridge().getWebView();
+                wv.postDelayed(new Runnable() { public void run() {
+                  wv.evaluateJavascript("window.onNativeVolume&&window.onNativeVolume(" + currentVolume() + ")", null);
+                }}, 150);
+              }
+              return r;
+            }
+          }
+          EOF
+          RES=android/app/src/main/res
+          mkdir -p $RES/drawable $RES/drawable-v24 $RES/mipmap-anydpi-v26
+          cat > $RES/drawable-v24/ic_sp_background.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+            <path android:pathData="M0,0h108v108h-108z">
+              <aapt:attr name="android:fillColor">
+                <gradient android:startX="0" android:startY="0" android:endX="108" android:endY="108" android:type="linear">
+                  <item android:offset="0" android:color="#37AEE2"/>
+                  <item android:offset="1" android:color="#1B7FB0"/>
+                </gradient>
+              </aapt:attr>
+            </path>
+          </vector>
+          EOF
+          cat > $RES/drawable/ic_sp_foreground.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#FFFFFF" android:strokeColor="#FFFFFF" android:strokeWidth="6"
+                android:strokeLineJoin="round" android:pathData="M43,31 L43,63 L71,47 Z"/>
+            <path android:strokeColor="#59FFFFFF" android:strokeWidth="4" android:strokeLineCap="round"
+                android:pathData="M38,77 L70,77"/>
+            <path android:strokeColor="#FFFFFF" android:strokeWidth="4" android:strokeLineCap="round"
+                android:pathData="M38,77 L52,77"/>
+          </vector>
+          EOF
+          for N in ic_launcher ic_launcher_round; do
+          cat > $RES/mipmap-anydpi-v26/$N.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@drawable/ic_sp_background"/>
+            <foreground android:drawable="@drawable/ic_sp_foreground"/>
+          </adaptive-icon>
+          EOF
+          done
+          npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmoothPlayer-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
